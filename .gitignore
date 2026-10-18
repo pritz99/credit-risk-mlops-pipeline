@@ -1,0 +1,16 @@
+# raw data (large binary files — not meant for version control)
+case_study1.xlsx
+case_study2.xlsx
+
+# local mlflow tracking store/artifacts
+mlartifacts/
+mlflow.db
+mlruns/
+
+# python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# env
+.env

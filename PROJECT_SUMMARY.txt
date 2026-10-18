@@ -1,0 +1,152 @@
+PROJECT: Credit Risk Classification Pipeline — Leakage-Free Feature Engineering & MLOps Refactor
+STATUS DATE: 2026-10-16
+REPO: c:\Users\Lenovo\Downloads\credit_card
+
+=== OBJECTIVE ===
+Build a multi-class (4-tier: P1/P2/P3/P4) credit risk classification model from bank/bureau
+application data, then refactor the original exploratory notebook into a modular,
+leakage-free, production-style scikit-learn pipeline with MLflow experiment tracking.
+
+=== DATA ===
+- case_study1.xlsx (~51K rows, 26 cols) + case_study2.xlsx (~51K rows, 62 cols),
+  merged on PROSPECTID (inner join).
+- Target column: Approved_Flag (categorical, 4 classes: P1, P2, P3, P4).
+- Raw sentinel value -99999 used for missing/invalid data; columns with >10,000 such
+  rows are dropped entirely, remaining -99999 rows are filtered out.
+
+=== KEY FINDING: TARGET LEAKAGE (fixed) ===
+- Initial RandomForestClassifier (n_estimators=200) achieved 99.04% accuracy — a red flag
+  for a 4-class problem.
+- Root cause: feature `Credit_Score` carried ~50% of total feature importance and
+  near-deterministically mapped to Approved_Flag bands (e.g. score 707-741 => 100% P1,
+  score 571-639 => 100% P4). Approved_Flag was almost certainly originally derived from
+  Credit_Score bands, so the feature was leaking the answer.
+- Fix: drop Credit_Score from the feature set. Honest baseline accuracy: ~76-77%.
+- Lesson generalized: statistical feature-selection tests (chi-square/VIF/ANOVA) only
+  measure predictor-target association strength — they do NOT detect this kind of
+  leakage, since a leaking feature looks "great" by those same tests.
+
+=== FEATURE SELECTION METHODOLOGY ===
+1. Chi-square test (categorical features vs. categorical target): drop a categorical
+   column when p-value > 0.05 (no significant association with target).
+   Categorical features: MARITALSTATUS, EDUCATION, GENDER, last_prod_enq2, first_prod_enq2.
+2. VIF (Variance Inflation Factor) sequential filtering (numeric features, unsupervised):
+   iteratively compute VIF for all numeric columns, drop the single worst offender
+   (highest VIF) if above threshold (6), recompute, repeat until all VIF <= threshold.
+   Sequential (not one-shot) removal is used because VIF is a group-relational property —
+   removing the worst offender can drop the VIF of other correlated columns below
+   threshold without needing to remove them too.
+3. ANOVA (numeric features vs. categorical target, supervised): f_oneway test grouping
+   each numeric feature by target class; keep features with p-value <= 0.05.
+   Only run on numeric columns that already survived the VIF filter.
+4. EDUCATION ordinal encoding (domain-driven, not statistical): SSC=1, 12TH=2,
+   UNDER GRADUATE=3, GRADUATE=3, PROFESSIONAL=3, POST-GRADUATE=4, OTHERS=1.
+   (UNDER GRADUATE/GRADUATE/PROFESSIONAL treated as equivalent tier per this dataset's
+   labeling convention.)
+5. Remaining nominal categoricals (MARITALSTATUS, GENDER, last_prod_enq2, first_prod_enq2)
+   one-hot encoded.
+
+=== MLOPS REFACTOR: NOTEBOOK -> MODULAR SKLEARN PIPELINE ===
+Original state: all logic (cleaning, merging, chi-square, VIF, ANOVA, encoding, model
+training) was inline notebook code in main_file.ipynb, executed top-to-bottom. Problems
+with this state:
+  - Feature selection (chi-square/VIF/ANOVA) was computed on the FULL dataset, including
+    what would become the test set, before train_test_split — a subtler leakage path
+    (test data influencing which features get selected).
+  - No reusability; logic duplicated/rewritten per experiment.
+  - No experiment tracking; results (e.g. the 99% vs 77% accuracy difference) only
+    existed as print statements, not reproducible records.
+
+Refactor approach (main_2.ipynb + src/ package):
+  - Data cleaning/merging (clean_mostly_null_cols, clean_mostly_null_rows,
+    find_merge_cols) kept as plain functions OUTSIDE any sklearn Pipeline, in
+    src/data_prep.py. Reason: these operations drop ROWS (not just columns) and are raw
+    ETL/data-quality steps unrelated to the target — they don't fit the Pipeline's
+    fit/transform contract (which assumes X and y stay row-aligned across all steps).
+  - Feature selection and encoding logic rewritten as custom scikit-learn-compatible
+    transformer classes (inherit BaseEstimator + TransformerMixin, implement
+    fit(X, y)/transform(X)), stored in src/transformers.py:
+      * ChiSquareSelector(alpha=0.05)   - supervised, fit(X, y) required
+      * VIFSelector(threshold=6)        - unsupervised, fit(X, y=None), y never used
+      * AnovaSelector(alpha=0.05)       - supervised, fit(X, y) required; must run
+                                          after VIFSelector in the pipeline order
+      * EduEncoder(col)                 - fixed ordinal map, no y needed
+      * build_onehot_step(cat_cols)     - helper returning a sklearn ColumnTransformer
+                                          wrapping OneHotEncoder(handle_unknown='ignore')
+                                          over named categorical columns only, with
+                                          remainder='passthrough' for everything else
+  - This closes the leakage path above: inside a Pipeline, fit() is only ever called on
+    X_train/y_train; transform() reuses what was learned when applied to X_test.
+  - Design rule established: a learned attribute inside fit() must be stored with a
+    trailing underscore (e.g. self.cols_to_keep_) and read back in transform(); nothing
+    computed locally inside fit() survives unless assigned to self.
+  - VIF and ANOVA deliberately kept as SEPARATE classes (not one combined class) because
+    VIF is unsupervised (fit(X) only) while ANOVA is supervised (fit(X, y) required) —
+    forcing them into one class would require a fit(X, y) signature even though half the
+    logic never touches y.
+  - Target (y / Approved_Flag) encoding, if needed at all, happens OUTSIDE the Pipeline
+    (e.g. via sklearn LabelEncoder before train_test_split) — Pipeline steps only ever
+    transform X, never y, so a target encoder cannot be a Pipeline step.
+    Note: RandomForestClassifier accepts string class labels directly, so y encoding may
+    be unnecessary entirely.
+
+=== REPO LAYOUT (current) ===
+credit_card/
+|-- main_2.ipynb         <- orchestration notebook: load data, build Pipeline, fit,
+|                           (next) mlflow logging
+|-- main_file.ipynb      <- original exploratory notebook (pre-refactor), kept for
+|                           reference / leakage diagnosis history
+|-- case_study1.xlsx
+|-- case_study2.xlsx
+|-- PROJECT_SUMMARY.txt  <- this file
+`-- src/
+    |-- __init__.py
+    |-- data_prep.py     <- clean_mostly_null_cols, clean_mostly_null_rows,
+    |                       find_merge_cols (in progress: not yet pasted in)
+    `-- transformers.py  <- ChiSquareSelector, VIFSelector, AnovaSelector, EduEncoder,
+                            build_onehot_step (DONE, reviewed, bug-fixed)
+
+=== STATUS: DONE vs IN PROGRESS ===
+DONE:
+  - Target leakage diagnosis and fix (Credit_Score removal).
+  - Chi-square / VIF / ANOVA feature selection methodology designed and validated.
+  - All 4 custom transformer classes + onehot helper written, reviewed, and bug-fixed
+    in src/transformers.py (typos, fit/transform state bugs, wrong .apply vs .map usage,
+    in-place mutation risk, unsupervised/supervised y handling — all caught and fixed
+    during review).
+
+IN PROGRESS / NEXT STEPS:
+  1. Paste clean_mostly_null_cols / clean_mostly_null_rows / find_merge_cols into
+     src/data_prep.py (currently empty placeholders).
+  2. Assemble the full sklearn Pipeline in main_2.ipynb:
+     Pipeline(steps=[
+         ('chi2_filter', ChiSquareSelector(alpha=0.05)),
+         ('vif_filter', VIFSelector(threshold=6)),
+         ('anova_filter', AnovaSelector(alpha=0.05)),
+         ('education_encode', EduEncoder(col='EDUCATION')),
+         ('onehot', build_onehot_step(cat_cols)),
+         ('model', RandomForestClassifier(n_estimators=200, random_state=42)),
+     ])
+  3. Fit on X_train/y_train, predict/evaluate on X_test/y_test; confirm honest accuracy
+     (~76-77%) reproduces through the new Pipeline.
+  4. Wrap the pipeline in mlflow.start_run(): log_param for every threshold/choice
+     (vif_threshold=6, chi2_alpha=0.05, anova_alpha=0.05, dropped_feature="Credit_Score",
+     n_estimators=200, test_size=0.2), log_metric for accuracy/precision/recall/F1,
+     log_artifact for intermediate tables (vif table, anova p-value table), and
+     log_model(pipe) to capture the ENTIRE pipeline (not just the bare classifier) as one
+     reloadable artifact.
+  5. Log two comparison runs (with vs. without Credit_Score) to make the leakage finding
+     visible directly in the MLflow UI as a concrete before/after.
+
+=== RESUME-READY SUMMARY (for reference) ===
+"Credit Risk Classification Pipeline — Leakage-Free Feature Engineering & MLOps Refactor.
+Multi-class (4-tier) credit risk model on merged bureau data (~51K records, 60+ raw
+features); diagnosed and eliminated a target-leakage feature that had inflated model
+accuracy from a fake 99% to a realistic ~77%; designed a statistically-grounded feature
+selection pipeline (chi-square, sequential VIF, ANOVA) cutting 60+ raw features to a
+validated non-redundant subset; refactored ad hoc notebook logic into custom
+scikit-learn-compatible transformer classes and a modular Python package, closing a
+subtler leakage path where feature-selection statistics had been computed on the full
+dataset (including test rows) before the train/test split; architecting MLflow-based
+experiment tracking (params, metrics, artifacts, full pipeline model logging) as the
+next phase."
